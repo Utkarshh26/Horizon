@@ -16,6 +16,7 @@ import (
 	"github.com/horizon/server/internal/config"
 	"github.com/horizon/server/internal/db"
 	"github.com/horizon/server/internal/events"
+	"github.com/horizon/server/internal/memlog"
 	"github.com/horizon/server/internal/protocol"
 	"github.com/horizon/server/internal/registry"
 )
@@ -25,6 +26,7 @@ type Handler struct {
 	Reg    *registry.Registry
 	Cfg    config.Config
 	Store  *db.Store
+	Mem    *memlog.Log
 	Events *events.Hub
 }
 
@@ -151,7 +153,30 @@ func (h *Handler) logAndBroadcast(
 	reqHeaders map[string]string,
 	reqBodyPlain string,
 ) {
+	now := time.Now().UTC()
 	latencyMs := int(latency.Milliseconds())
+
+	// Always populate the in-memory dashboard log if enabled (works without Postgres).
+	if h.Mem != nil {
+		sc, lm := res.Status, latencyMs
+		reqHeadersJSON, _ := json.Marshal(reqHeaders)
+		respHeadersJSON, _ := json.Marshal(res.HeaderMap)
+		reqBody := truncate(reqBodyPlain, 65536)
+		respBody := truncate(string(res.Body), 65536)
+		h.Mem.Add(db.RequestLogRow{
+			ID:              uuid.MustParse(reqID),
+			TunnelID:        client.ID,
+			Method:          method,
+			Path:            path,
+			StatusCode:      &sc,
+			LatencyMs:       &lm,
+			RequestAt:       now,
+			RequestHeaders:  reqHeadersJSON,
+			RequestBody:     stringPtrOrNil(reqBody),
+			ResponseHeaders: respHeadersJSON,
+			ResponseBody:    stringPtrOrNil(respBody),
+		})
+	}
 
 	if h.Store != nil {
 		reqHeadersJSON, _ := json.Marshal(reqHeaders)
@@ -176,11 +201,12 @@ func (h *Handler) logAndBroadcast(
 	}
 
 	if h.Events != nil {
-		h.publishRequestEvent(sub, client, reqID, method, path, res.Status, latencyMs)
+		h.publishRequestEvent(sub, client, reqID, method, path, res.Status, latencyMs, now)
 	}
+
 }
 
-func (h *Handler) publishRequestEvent(sub string, client *registry.ClientConnection, reqID, method, path string, status, latencyMs int) {
+func (h *Handler) publishRequestEvent(sub string, client *registry.ClientConnection, reqID, method, path string, status, latencyMs int, at time.Time) {
 	h.Events.Publish(events.Event{
 		Type: events.TypeRequest,
 		Payload: map[string]interface{}{
@@ -191,7 +217,7 @@ func (h *Handler) publishRequestEvent(sub string, client *registry.ClientConnect
 			"path":        path,
 			"status_code": status,
 			"latency_ms":  latencyMs,
-			"request_at":  time.Now().UTC().Format(time.RFC3339Nano),
+			"request_at":  at.UTC().Format(time.RFC3339Nano),
 		},
 	})
 }
@@ -201,4 +227,11 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max] + fmt.Sprintf("…(truncated,%d bytes)", len(s))
+}
+
+func stringPtrOrNil(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

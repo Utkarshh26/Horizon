@@ -16,6 +16,7 @@ import (
 	"github.com/horizon/server/internal/config"
 	"github.com/horizon/server/internal/db"
 	"github.com/horizon/server/internal/events"
+	"github.com/horizon/server/internal/memlog"
 	"github.com/horizon/server/internal/registry"
 )
 
@@ -26,7 +27,7 @@ var upgrader = websocket.Upgrader{
 }
 
 // Router mounts REST + dashboard WebSocket on /api/*.
-func Router(reg *registry.Registry, store *db.Store, hub *events.Hub, cfg config.Config) http.Handler {
+func Router(reg *registry.Registry, store *db.Store, mem *memlog.Log, hub *events.Hub, cfg config.Config) http.Handler {
 	r := mux.NewRouter()
 	r.Use(corsMiddleware)
 
@@ -50,59 +51,74 @@ func Router(reg *registry.Registry, store *db.Store, hub *events.Hub, cfg config
 	}).Methods(http.MethodGet, http.MethodOptions)
 
 	r.HandleFunc("/requests", func(w http.ResponseWriter, req *http.Request) {
-		if store == nil {
-			writeJSON(w, []db.RequestLogRow{})
+		// Prefer Postgres when configured (persistence across restarts), otherwise fall back to in-memory log.
+		if store != nil {
+			ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
+			defer cancel()
+			rows, err := store.ListRecentRequests(ctx, 200)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, rows)
 			return
 		}
-		ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
-		defer cancel()
-		rows, err := store.ListRecentRequests(ctx, 200)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+		if mem != nil {
+			writeJSON(w, mem.List(200))
 			return
 		}
-		writeJSON(w, rows)
+		writeJSON(w, []db.RequestLogRow{})
 	}).Methods(http.MethodGet, http.MethodOptions)
 
 	r.HandleFunc("/requests/{id}", func(w http.ResponseWriter, req *http.Request) {
-		if store == nil {
-			http.Error(w, "database not configured", http.StatusServiceUnavailable)
-			return
-		}
 		id, err := uuid.Parse(mux.Vars(req)["id"])
 		if err != nil {
 			http.Error(w, "bad id", http.StatusBadRequest)
 			return
 		}
-		ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
-		defer cancel()
-		row, err := store.GetRequest(ctx, id)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				http.Error(w, "not found", http.StatusNotFound)
+		// Prefer Postgres; if not configured, fall back to in-memory.
+		if store != nil {
+			ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
+			defer cancel()
+			row, err := store.GetRequest(ctx, id)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					http.Error(w, "not found", http.StatusNotFound)
+					return
+				}
+				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			writeJSON(w, row)
 			return
 		}
-		writeJSON(w, row)
+		if mem != nil {
+			if row, ok := mem.Get(id); ok {
+				writeJSON(w, row)
+				return
+			}
+		}
+		http.Error(w, "not found", http.StatusNotFound)
 	}).Methods(http.MethodGet, http.MethodOptions)
 
 	r.HandleFunc("/stats/volume", func(w http.ResponseWriter, req *http.Request) {
-		ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
-		defer cancel()
-		var points []db.RequestVolumePoint
-		var err error
+		// Prefer Postgres; else fall back to in-memory; else return zero-filled series.
 		if store != nil {
-			points, err = store.RequestVolumeLastMinutes(ctx, 30)
-		} else {
-			points = db.EmptyVolumePoints(30)
-		}
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			ctx, cancel := context.WithTimeout(req.Context(), 10*time.Second)
+			defer cancel()
+			points, err := store.RequestVolumeLastMinutes(ctx, 30)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			writeJSON(w, points)
 			return
 		}
-		writeJSON(w, points)
+		if mem != nil {
+			writeJSON(w, mem.VolumeLastMinutes(30))
+			return
+		}
+		writeJSON(w, db.EmptyVolumePoints(30))
 	}).Methods(http.MethodGet, http.MethodOptions)
 
 	r.HandleFunc("/config", func(w http.ResponseWriter, req *http.Request) {

@@ -17,6 +17,7 @@ import (
 	"github.com/horizon/server/internal/config"
 	"github.com/horizon/server/internal/db"
 	"github.com/horizon/server/internal/events"
+	"github.com/horizon/server/internal/memlog"
 	"github.com/horizon/server/internal/proxy"
 	"github.com/horizon/server/internal/registry"
 	"github.com/horizon/server/internal/tunnel"
@@ -35,12 +36,13 @@ func main() {
 
 	reg := registry.New()
 	hub := events.NewHub()
+	mem := memlog.New()
 
-	ph := &proxy.Handler{Reg: reg, Cfg: cfg, Store: store, Events: hub}
+	ph := &proxy.Handler{Reg: reg, Cfg: cfg, Store: store, Mem: mem, Events: hub}
 
 	r := mux.NewRouter()
 	r.HandleFunc("/health", healthHandler(reg, store)).Methods(http.MethodGet)
-	r.PathPrefix("/api").Handler(api.Router(reg, store, hub, cfg))
+	r.PathPrefix("/api").Handler(api.Router(reg, store, mem, hub, cfg))
 	r.HandleFunc("/tunnel/connect", func(w http.ResponseWriter, req *http.Request) {
 		tunnel.HandleConnect(reg, store, hub, cfg, w, req)
 	}).Methods(http.MethodGet)
